@@ -7,11 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/mat/besticon/v3/besticon"
+	"github.com/mat/besticon/v3/vcr"
 )
 
 func TestGetIndex(t *testing.T) {
@@ -37,7 +40,7 @@ func TestGetIcons(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	s := newTestServer()
+	s := newTestServerWithVCR(t, "apple.com.icons.vcr")
 	s.iconsHandler(w, req)
 
 	assertStringEquals(t, "200", fmt.Sprintf("%d", w.Code))
@@ -58,7 +61,7 @@ func TestGetIcon(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	s := newTestServer()
+	s := newTestServerWithVCR(t, "apple.com.icon.vcr")
 	s.iconHandler(w, req)
 
 	assertStringEquals(t, "302", fmt.Sprintf("%d", w.Code))
@@ -74,7 +77,7 @@ func TestGetIconWithDownloadMode(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	s := newTestServer()
+	s := newTestServerWithVCR(t, "apple.com.icon_download.vcr")
 	s.iconHandler(w, req)
 
 	assertStringEquals(t, "200", fmt.Sprintf("%d", w.Code))
@@ -166,7 +169,7 @@ func TestGetAllIcons(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	s := newTestServer()
+	s := newTestServerWithVCR(t, "apple.com.allicons.vcr")
 	s.alliconsHandler(w, req)
 
 	assertStringEquals(t, "200", fmt.Sprintf("%d", w.Code))
@@ -295,5 +298,36 @@ func newTestServer() *server {
 		maxIconSize:   500,
 		cacheDuration: 720 * time.Hour,
 		besticon:      besticon.New(besticon.WithLogger(besticon.NewDefaultLogger(io.Discard))),
+	}
+}
+
+// newTestServerWithVCR keeps the server setup identical to newTestServer
+// but injects a VCR-backed HTTP client, so tests replay deterministic
+// fixture responses instead of hitting the live network.
+func newTestServerWithVCR(t *testing.T, fixtureFilename string) *server {
+	t.Helper()
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not determine test file path")
+	}
+
+	path := filepath.Join(filepath.Dir(thisFile), "..", "testdata", fixtureFilename)
+	client, f, err := vcr.Client(path)
+	if err != nil {
+		t.Fatalf("could not init vcr client: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = f.Close()
+	})
+
+	return &server{
+		maxIconSize:   500,
+		cacheDuration: 720 * time.Hour,
+		besticon: besticon.New(
+			besticon.WithHTTPClient(client),
+			besticon.WithLogger(besticon.NewDefaultLogger(io.Discard)),
+		),
 	}
 }
