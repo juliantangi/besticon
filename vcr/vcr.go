@@ -192,7 +192,6 @@ func NewReplayerTransport(reader io.Reader) (*replayerTransport, error) {
 		}
 	}
 
-	return t, nil
 }
 
 func (t *replayerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
