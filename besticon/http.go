@@ -43,12 +43,31 @@ func NewDefaultHTTPTransport(userAgent string) http.RoundTripper {
 // A/AAAA records. This is the actual security boundary against SSRF/DNS
 // rebinding; checkPublicHost is only a fast-fail pre-flight check on top of
 // it and must not be relied on alone.
-var safeTransport http.RoundTripper = &http.Transport{
-	DialContext: (&net.Dialer{
+//
+// It is built by cloning http.DefaultTransport rather than by constructing a
+// bare http.Transport, so that the stdlib's connection-pool and timeout
+// defaults are preserved: a zero-valued Transport has no idle-connection
+// limit and no IdleConnTimeout, which for a service that fetches from an
+// unbounded set of hosts means idle connections accumulate and are never
+// reaped. Cloning also keeps ForceAttemptHTTP2, without which a Transport
+// carrying a custom DialContext silently drops to HTTP/1.1.
+var safeTransport http.RoundTripper = newSafeTransport()
+
+func newSafeTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+
+	// Deliberately no proxy. With a proxy configured the dialer connects to
+	// the proxy, so Control would validate the proxy's address and never see
+	// the real target — the SSRF filter would pass everything.
+	t.Proxy = nil
+
+	t.DialContext = (&net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 		Control:   controlBlockPrivateAddr,
-	}).DialContext,
+	}).DialContext
+
+	return t
 }
 
 func controlBlockPrivateAddr(network, address string, c syscall.RawConn) error {
@@ -136,8 +155,11 @@ func isPrivateIP(ipAddr *net.IPAddr) bool {
 	}
 
 	ip := ipAddr.IP
-	// Unmap IPv4-in-IPv6 (e.g. ::ffff:169.254.169.254) before checking,
-	// since the net.IP predicates below don't do this themselves.
+	// Unmap IPv4-in-IPv6 (e.g. ::ffff:100.64.0.1) to its 4-byte form. The
+	// net.IP predicates below each call To4 internally, so this is not for
+	// their benefit — it is what lets the hand-rolled CGNAT check further
+	// down match on len(ip) == 4. Removing it silently stops that check
+	// seeing IPv4-mapped addresses.
 	if ip4 := ip.To4(); ip4 != nil {
 		ip = ip4
 	}
@@ -145,7 +167,6 @@ func isPrivateIP(ipAddr *net.IPAddr) bool {
 	if ip.IsLoopback() ||
 		ip.IsPrivate() ||
 		ip.IsLinkLocalUnicast() || // 169.254.0.0/16, fe80::/10
-		ip.IsLinkLocalMulticast() ||
 		ip.IsMulticast() || // 224.0.0.0/4, ff00::/8
 		ip.IsUnspecified() { // 0.0.0.0, ::
 		return true

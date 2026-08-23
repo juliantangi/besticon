@@ -33,8 +33,10 @@ func TestIsPrivateIP(t *testing.T) {
 		{"link-local v6", "fe80::1", true},
 
 		// Multicast
-		{"multicast v4", "224.0.0.1", true},
+		{"multicast v4 link-local", "224.0.0.1", true},
+		{"multicast v4 global scope", "239.1.2.3", true},
 		{"link-local multicast v6", "ff02::1", true},
+		{"multicast v6 global scope", "ff0e::1", true},
 
 		// Unspecified
 		{"unspecified v4", "0.0.0.0", true},
@@ -48,6 +50,7 @@ func TestIsPrivateIP(t *testing.T) {
 
 		// IPv4-mapped IPv6
 		{"ipv4-mapped metadata", "::ffff:169.254.169.254", true},
+		{"ipv4-mapped cgnat", "::ffff:100.64.0.1", true},
 
 		// IPv6 transition addresses embedding a private IPv4
 		{"6to4 metadata", "2002:a9fe:a9fe::", true},
@@ -127,7 +130,8 @@ func TestControlBlockPrivateAddr(t *testing.T) {
 		{"loopback", "127.0.0.1:8080", true},
 		{"cgnat", "100.100.100.200:80", true},
 		{"public ip", "8.8.8.8:443", false},
-		{"invalid address", "not-an-address", true},
+		{"no port at all", "not-an-address", true},
+		{"host:port but not an IP literal", "metadata.internal:80", true},
 	}
 
 	for _, tt := range tests {
@@ -267,4 +271,34 @@ func linkLocalHost(t *testing.T) string {
 	}
 	t.Skip("no usable link-local IPv4 address on host")
 	return ""
+}
+
+// TestSafeTransportKeepsStdlibDefaults guards against safeTransport being
+// rebuilt as a bare &http.Transport{}, which would silently drop the
+// connection-pool bounds, the TLS handshake timeout and HTTP/2.
+func TestSafeTransportKeepsStdlibDefaults(t *testing.T) {
+	def := http.DefaultTransport.(*http.Transport)
+	got, ok := safeTransport.(*http.Transport)
+	if !ok {
+		t.Fatalf("safeTransport is %T, want *http.Transport", safeTransport)
+	}
+
+	if got.Proxy != nil {
+		t.Error("safeTransport must not use a proxy: Control would validate the proxy address, not the target")
+	}
+	if !got.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 must stay set, or a custom DialContext drops the transport to HTTP/1.1")
+	}
+	if got.MaxIdleConns != def.MaxIdleConns {
+		t.Errorf("MaxIdleConns = %d, want %d (0 means unbounded)", got.MaxIdleConns, def.MaxIdleConns)
+	}
+	if got.IdleConnTimeout != def.IdleConnTimeout {
+		t.Errorf("IdleConnTimeout = %v, want %v (0 means idle conns are never reaped)", got.IdleConnTimeout, def.IdleConnTimeout)
+	}
+	if got.TLSHandshakeTimeout != def.TLSHandshakeTimeout {
+		t.Errorf("TLSHandshakeTimeout = %v, want %v", got.TLSHandshakeTimeout, def.TLSHandshakeTimeout)
+	}
+	if got.ExpectContinueTimeout != def.ExpectContinueTimeout {
+		t.Errorf("ExpectContinueTimeout = %v, want %v", got.ExpectContinueTimeout, def.ExpectContinueTimeout)
+	}
 }
