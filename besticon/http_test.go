@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 )
 
@@ -182,52 +181,6 @@ func TestDialTimeEnforcementEndToEnd(t *testing.T) {
 	}
 }
 
-// TestGetFollowsRedirectToPrivateHost verifies that a public host which
-// redirects to a loopback/private address cannot be used to reach an internal
-// service. The initial-host check alone is not enough: the redirect target
-// must be re-validated too.
-func TestGetFollowsRedirectToPrivateHost(t *testing.T) {
-	var internalHit int32
-
-	// "Internal" service on loopback. A direct request to it is rejected by
-	// the initial-host check; reaching it requires the redirect bypass.
-	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&internalHit, 1)
-		w.Write([]byte("INTERNAL"))
-	}))
-	defer internal.Close()
-
-	// Public decoy: bound to the host link-local address (non-loopback,
-	// non-private per net.IP), so the initial-host check allows it. It
-	// redirects to the loopback internal service.
-	llHost := linkLocalHost(t)
-	ln, err := net.Listen("tcp", llHost+":0")
-	if err != nil {
-		t.Skipf("cannot bind link-local %s: %v", llHost, err)
-	}
-	decoy := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, internal.URL+"/secret", http.StatusFound)
-	})}
-	go decoy.Serve(ln)
-	defer decoy.Close()
-
-	b := New()
-	resp, err := b.Get("http://" + ln.Addr().String() + "/favicon")
-	if resp != nil {
-		resp.Body.Close()
-	}
-
-	if atomic.LoadInt32(&internalHit) != 0 {
-		t.Fatalf("redirect bypass: internal loopback service was reached via 302 (hits=%d)", internalHit)
-	}
-	if err == nil {
-		t.Fatalf("expected redirect to private host to be rejected, got nil error")
-	}
-	if !strings.Contains(err.Error(), "private ip address disallowed") {
-		t.Fatalf("expected 'private ip address disallowed', got: %v", err)
-	}
-}
-
 // TestGetRejectsDirectPrivateHost is the negative control: a direct request to
 // a loopback address is already rejected by the initial-host check.
 func TestGetRejectsDirectPrivateHost(t *testing.T) {
@@ -246,31 +199,69 @@ func TestGetRejectsDirectPrivateHost(t *testing.T) {
 	}
 }
 
-// linkLocalHost returns a usable non-loopback, non-private IP (link-local) on
-// the host so the decoy server passes the initial-host check.
-func linkLocalHost(t *testing.T) string {
-	t.Helper()
-	addrs, err := net.InterfaceAddrs()
+// TestCheckRedirectRejectsPrivateTarget exercises the redirect guard that
+// NewDefaultHTTPClient installs.
+//
+// It replaces TestGetFollowsRedirectToPrivateHost, which can no longer work:
+// that test bound its "public" decoy server to a link-local address
+// specifically because isPrivateIP used to treat link-local as public. Now
+// that link-local is blocked, Besticon.Get rejects the decoy at the
+// initial-host check and the redirect path is never reached — and since the
+// initial-host check returns the same "private ip address disallowed" error
+// the assertion still passed, so the test could not fail loudly. On any host
+// without a 169.254.0.0/16 address (containers, most CI runners) it skipped
+// outright.
+//
+// Calling CheckRedirect directly needs no bindable address, so this runs
+// deterministically everywhere.
+func TestCheckRedirectRejectsPrivateTarget(t *testing.T) {
+	c := NewDefaultHTTPClient()
+	if c.CheckRedirect == nil {
+		t.Fatal("NewDefaultHTTPClient must install a CheckRedirect guard")
+	}
+
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"loopback", "http://127.0.0.1/secret", true},
+		{"rfc1918", "http://10.0.0.1/secret", true},
+		{"cloud metadata", "http://169.254.169.254/latest/meta-data/", true},
+		{"cgnat", "http://100.64.0.1/secret", true},
+		{"ipv4-mapped metadata", "http://[::ffff:169.254.169.254]/secret", true},
+		{"public target still allowed", "http://8.8.8.8/favicon.ico", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", tt.url, nil)
+			if err != nil {
+				t.Fatalf("bad test URL %q: %v", tt.url, err)
+			}
+			err = c.CheckRedirect(req, nil)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("CheckRedirect(%s) err = %v, wantErr %v", tt.url, err, tt.wantErr)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), "private ip address disallowed") {
+				t.Fatalf("CheckRedirect(%s) = %v, want 'private ip address disallowed'", tt.url, err)
+			}
+		})
+	}
+}
+
+// TestCheckRedirectStopsRedirectChain pins the hop limit, the other half of
+// the CheckRedirect contract.
+func TestCheckRedirectStopsRedirectChain(t *testing.T) {
+	c := NewDefaultHTTPClient()
+	req, err := http.NewRequest("GET", "http://8.8.8.8/favicon.ico", nil)
 	if err != nil {
-		t.Skipf("cannot enumerate interfaces: %v", err)
+		t.Fatalf("bad test URL: %v", err)
 	}
-	for _, a := range addrs {
-		var ip net.IP
-		switch v := a.(type) {
-		case *net.IPNet:
-			ip = v.IP
-		case *net.IPAddr:
-			ip = v.IP
-		}
-		if ip == nil || ip.To4() == nil {
-			continue
-		}
-		if ip.IsLinkLocalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() {
-			return ip.String()
-		}
+	if err := c.CheckRedirect(req, make([]*http.Request, 10)); err == nil ||
+		!strings.Contains(err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("expected redirect-limit error at 10 hops, got: %v", err)
 	}
-	t.Skip("no usable link-local IPv4 address on host")
-	return ""
 }
 
 // TestSafeTransportKeepsStdlibDefaults guards against safeTransport being
