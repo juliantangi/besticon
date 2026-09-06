@@ -116,6 +116,12 @@ func (s *server) iconHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if getTrueFromEnv("DISABLE_LETTER_FALLBACK") {
+		addCacheControl(w, s.cacheDuration)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	iconColor := finder.MainColorForIcons()
 	letter := lettericon.MainLetterFromURL(url)
 
