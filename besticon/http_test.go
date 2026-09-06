@@ -4,54 +4,230 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"slices"
 	"strings"
-	"sync/atomic"
 	"testing"
 )
 
-// TestGetFollowsRedirectToPrivateHost verifies that a public host which
-// redirects to a loopback/private address cannot be used to reach an internal
-// service. The initial-host check alone is not enough: the redirect target
-// must be re-validated too.
-func TestGetFollowsRedirectToPrivateHost(t *testing.T) {
-	var internalHit int32
+func TestIsPrivateIP(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		// Loopback
+		{"loopback v4", "127.0.0.1", true},
+		{"loopback v6", "::1", true},
 
-	// "Internal" service on loopback. A direct request to it is rejected by
-	// the initial-host check; reaching it requires the redirect bypass.
-	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&internalHit, 1)
-		w.Write([]byte("INTERNAL"))
-	}))
-	defer internal.Close()
+		// RFC1918 private
+		{"rfc1918 10.x", "10.0.0.1", true},
+		{"rfc1918 172.16.x", "172.16.0.1", true},
+		{"rfc1918 192.168.x", "192.168.0.1", true},
 
-	// Public decoy: bound to the host link-local address (non-loopback,
-	// non-private per net.IP), so the initial-host check allows it. It
-	// redirects to the loopback internal service.
-	llHost := linkLocalHost(t)
-	ln, err := net.Listen("tcp", llHost+":0")
-	if err != nil {
-		t.Skipf("cannot bind link-local %s: %v", llHost, err)
+		// RFC4193 unique local IPv6
+		{"rfc4193", "fc00::1", true},
+
+		// Link-local unicast
+		{"link-local v4 metadata", "169.254.169.254", true},
+		{"link-local v4", "169.254.1.1", true},
+		{"link-local v6", "fe80::1", true},
+
+		// Multicast
+		{"multicast v4 link-local", "224.0.0.1", true},
+		{"multicast v4 global scope", "239.1.2.3", true},
+		{"link-local multicast v6", "ff02::1", true},
+		{"multicast v6 global scope", "ff0e::1", true},
+
+		// Unspecified
+		{"unspecified v4", "0.0.0.0", true},
+		{"unspecified v6", "::", true},
+
+		// CGNAT / RFC 6598 (100.64.0.0/10)
+		{"cgnat start", "100.64.0.1", true},
+		{"cgnat end", "100.127.255.255", true},
+		{"cgnat just below range", "100.63.255.255", false},
+		{"cgnat just above range", "100.128.0.0", false},
+
+		// IPv4-mapped IPv6
+		{"ipv4-mapped metadata", "::ffff:169.254.169.254", true},
+		{"ipv4-mapped cgnat", "::ffff:100.64.0.1", true},
+
+		// IPv6 transition addresses embedding a private IPv4
+		{"6to4 metadata", "2002:a9fe:a9fe::", true},
+		{"nat64 metadata", "64:ff9b::a9fe:a9fe", true},
+		{"teredo metadata", "2001::5601:5601", true},
+
+		// Additional IANA special-purpose ranges
+		{"this-network non-zero", "0.1.2.3", true},
+		{"IETF protocol assignments", "192.0.0.1", true},
+		{"6to4 relay anycast", "192.88.99.1", true},
+		{"benchmarking v4", "198.18.0.1", true},
+		{"TEST-NET-1", "192.0.2.1", true},
+		{"reserved 240/4", "240.0.0.1", true},
+		{"limited broadcast", "255.255.255.255", true},
+		{"ipv4-compatible metadata", "::169.254.169.254", true},
+		{"ipv4-compatible rfc1918", "::10.0.0.1", true},
+		{"site-local v6", "fec0::1", true},
+		{"discard-only", "100::1", true},
+		{"documentation v6", "2001:db8::1", true},
+		{"benchmarking v6", "2001:2::1", true},
+		{"orchidv2", "2001:20::1", true},
+		{"srv6 sids", "5f00::1", true},
+
+		// RFC 8215 local-use NAT64 (64:ff9b:1::/48) -- the gap this table closes.
+		// Both RFC 6052 embeddings of the metadata endpoint must be caught.
+		{"nat64 local-use /96 metadata", "64:ff9b:1::a9fe:a9fe", true},
+		{"nat64 local-use /48 metadata", "64:ff9b:1:a9fe:0:a9fe::", true},
+
+		// Transition addresses wrapping a PUBLIC IPv4 must stay reachable, or
+		// IPv6-only and 6to4 deployments break.
+		{"nat64 well-known public", "64:ff9b::8.8.8.8", false},
+		{"nat64 local-use public /96", "64:ff9b:1::8.8.8.8", false},
+		{"6to4 public", "2002:0808:0808::", false},
+
+		// Public IPs must not be flagged
+		{"public v4 google dns", "8.8.8.8", false},
+		{"public v4 cloudflare dns", "1.1.1.1", false},
+		{"public v6", "2606:4700:4700::1111", false},
 	}
-	decoy := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, internal.URL+"/secret", http.StatusFound)
-	})}
-	go decoy.Serve(ln)
-	defer decoy.Close()
 
-	b := New()
-	resp, err := b.Get("http://" + ln.Addr().String() + "/favicon")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ip := net.ParseIP(tt.ip)
+			if ip == nil {
+				t.Fatalf("failed to parse test IP %q", tt.ip)
+			}
+			got := isPrivateIP(&net.IPAddr{IP: ip})
+			if got != tt.want {
+				t.Errorf("isPrivateIP(%s) = %v, want %v", tt.ip, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsPrivateIPNil(t *testing.T) {
+	if isPrivateIP(nil) {
+		t.Error("isPrivateIP(nil) should be false")
+	}
+}
+
+// TestIsPrivateIPMalformed pins the fail-closed branch. A net.IP that is
+// neither 4 nor 16 bytes cannot be dialed, so classifying it as public would
+// be a fail-open default on the security path. Neither caller can produce one
+// today -- net.ResolveIPAddr and net.ParseIP both yield valid lengths or an
+// error -- which is exactly why it needs a test rather than a reader's trust.
+func TestIsPrivateIPMalformed(t *testing.T) {
+	for _, ip := range []net.IP{{}, {1, 2, 3}, {1, 2, 3, 4, 5}, make(net.IP, 15), make(net.IP, 17)} {
+		if !isPrivateIP(&net.IPAddr{IP: ip}) {
+			t.Errorf("isPrivateIP(%d-byte IP) = false, want true (fail closed)", len(ip))
+		}
+	}
+}
+
+func TestEmbeddedIPv4(t *testing.T) {
+	tests := []struct {
+		name string
+		ip   string
+		want []string // empty means no embedding
+	}{
+		{"6to4", "2002:a9fe:a9fe::", []string{"169.254.169.254"}},
+		{"nat64 well-known", "64:ff9b::a9fe:a9fe", []string{"169.254.169.254"}},
+		{"teredo", "2001::5601:5601", []string{"169.254.169.254"}},
+		{"ipv4-translated", "::ffff:0:a9fe:a9fe", []string{"169.254.169.254"}},
+		// The local-use NAT64 prefix has no recoverable embedding length, so
+		// every plausible RFC 6052 offset is returned. Zero decodes are dropped.
+		{"nat64 local-use /96", "64:ff9b:1::a9fe:a9fe", []string{"169.254.169.254"}},
+		{"non-transition ipv6", "2606:4700:4700::1111", nil},
+		{"plain ipv4", "8.8.8.8", nil},
+		{"ipv4-mapped", "::ffff:8.8.8.8", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, err := netip.ParseAddr(tt.ip)
+			if err != nil {
+				t.Fatalf("failed to parse test IP %q: %v", tt.ip, err)
+			}
+			got := embeddedIPv4(addr.Unmap())
+			var gotStr []string
+			for _, g := range got {
+				gotStr = append(gotStr, g.String())
+			}
+			for _, want := range tt.want {
+				if !slices.Contains(gotStr, want) {
+					t.Errorf("embeddedIPv4(%s) = %v, want it to contain %s", tt.ip, gotStr, want)
+				}
+			}
+			if len(tt.want) == 0 && len(got) != 0 {
+				t.Errorf("embeddedIPv4(%s) = %v, want none", tt.ip, gotStr)
+			}
+		})
+	}
+}
+
+// TestControlBlockPrivateAddr verifies the dial-time Control callback used by
+// safeTransport directly, since it is invoked by net.Dialer with a raw
+// "host:port" string rather than through isPrivateIP's net.IPAddr signature.
+func TestControlBlockPrivateAddr(t *testing.T) {
+	tests := []struct {
+		name    string
+		address string
+		wantErr bool
+	}{
+		{"metadata endpoint", "169.254.169.254:80", true},
+		{"loopback", "127.0.0.1:8080", true},
+		{"cgnat", "100.100.100.200:80", true},
+		{"public ip", "8.8.8.8:443", false},
+		{"no port at all", "not-an-address", true},
+		{"host:port but not an IP literal", "metadata.internal:80", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := controlBlockPrivateAddr("tcp", tt.address, nil)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("controlBlockPrivateAddr(%q) err = %v, wantErr %v", tt.address, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestDialTimeEnforcementEndToEnd drives a real request through the
+// transport built by NewDefaultHTTPTransport (the one wired into
+// Besticon.Get's http.Client) to confirm a private target is rejected at
+// dial time, not just at the isPrivateIP unit level. It calls the
+// transport's RoundTrip directly rather than going through Besticon.Get, so
+// that a plain loopback listener suffices: Get's own pre-flight
+// checkPublicHost check would otherwise reject a loopback target before the
+// dialer ever ran, which would prove nothing about the dial-time Control
+// callback specifically.
+func TestDialTimeEnforcementEndToEnd(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("cannot listen on loopback: %v", err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("SHOULD NOT BE REACHABLE"))
+	})}
+	go srv.Serve(ln)
+	defer srv.Close()
+
+	client := &http.Client{Transport: NewDefaultHTTPTransport("test-agent")}
+	req, err := http.NewRequest("GET", "http://"+ln.Addr().String()+"/favicon", nil)
+	if err != nil {
+		t.Fatalf("failed to build request: %v", err)
+	}
+
+	resp, err := client.Do(req)
 	if resp != nil {
 		resp.Body.Close()
 	}
-
-	if atomic.LoadInt32(&internalHit) != 0 {
-		t.Fatalf("redirect bypass: internal loopback service was reached via 302 (hits=%d)", internalHit)
-	}
 	if err == nil {
-		t.Fatalf("expected redirect to private host to be rejected, got nil error")
+		t.Fatal("expected dial-time rejection of loopback address, got nil error")
 	}
-	if !strings.Contains(err.Error(), "private ip address disallowed") {
-		t.Fatalf("expected 'private ip address disallowed', got: %v", err)
+	if !strings.Contains(err.Error(), "blocked: private/reserved address") {
+		t.Fatalf("expected dial-time block error, got: %v", err)
 	}
 }
 
@@ -73,29 +249,97 @@ func TestGetRejectsDirectPrivateHost(t *testing.T) {
 	}
 }
 
-// linkLocalHost returns a usable non-loopback, non-private IP (link-local) on
-// the host so the decoy server passes the initial-host check.
-func linkLocalHost(t *testing.T) string {
-	t.Helper()
-	addrs, err := net.InterfaceAddrs()
+// TestCheckRedirectRejectsPrivateTarget exercises the redirect guard that
+// NewDefaultHTTPClient installs.
+//
+// It replaces TestGetFollowsRedirectToPrivateHost, which can no longer work:
+// that test bound its "public" decoy server to a link-local address
+// specifically because isPrivateIP used to treat link-local as public. Now
+// that link-local is blocked, Besticon.Get rejects the decoy at the
+// initial-host check and the redirect path is never reached — and since the
+// initial-host check returns the same "private ip address disallowed" error
+// the assertion still passed, so the test could not fail loudly. On any host
+// without a 169.254.0.0/16 address (containers, most CI runners) it skipped
+// outright.
+//
+// Calling CheckRedirect directly needs no bindable address, so this runs
+// deterministically everywhere.
+func TestCheckRedirectRejectsPrivateTarget(t *testing.T) {
+	c := NewDefaultHTTPClient()
+	if c.CheckRedirect == nil {
+		t.Fatal("NewDefaultHTTPClient must install a CheckRedirect guard")
+	}
+
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{"loopback", "http://127.0.0.1/secret", true},
+		{"rfc1918", "http://10.0.0.1/secret", true},
+		{"cloud metadata", "http://169.254.169.254/latest/meta-data/", true},
+		{"cgnat", "http://100.64.0.1/secret", true},
+		{"ipv4-mapped metadata", "http://[::ffff:169.254.169.254]/secret", true},
+		{"public target still allowed", "http://8.8.8.8/favicon.ico", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", tt.url, nil)
+			if err != nil {
+				t.Fatalf("bad test URL %q: %v", tt.url, err)
+			}
+			err = c.CheckRedirect(req, nil)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("CheckRedirect(%s) err = %v, wantErr %v", tt.url, err, tt.wantErr)
+			}
+			if tt.wantErr && !strings.Contains(err.Error(), "private ip address disallowed") {
+				t.Fatalf("CheckRedirect(%s) = %v, want 'private ip address disallowed'", tt.url, err)
+			}
+		})
+	}
+}
+
+// TestCheckRedirectStopsRedirectChain pins the hop limit, the other half of
+// the CheckRedirect contract.
+func TestCheckRedirectStopsRedirectChain(t *testing.T) {
+	c := NewDefaultHTTPClient()
+	req, err := http.NewRequest("GET", "http://8.8.8.8/favicon.ico", nil)
 	if err != nil {
-		t.Skipf("cannot enumerate interfaces: %v", err)
+		t.Fatalf("bad test URL: %v", err)
 	}
-	for _, a := range addrs {
-		var ip net.IP
-		switch v := a.(type) {
-		case *net.IPNet:
-			ip = v.IP
-		case *net.IPAddr:
-			ip = v.IP
-		}
-		if ip == nil || ip.To4() == nil {
-			continue
-		}
-		if ip.IsLinkLocalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() {
-			return ip.String()
-		}
+	if err := c.CheckRedirect(req, make([]*http.Request, 10)); err == nil ||
+		!strings.Contains(err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("expected redirect-limit error at 10 hops, got: %v", err)
 	}
-	t.Skip("no usable link-local IPv4 address on host")
-	return ""
+}
+
+// TestSafeTransportKeepsStdlibDefaults guards against safeTransport being
+// rebuilt as a bare &http.Transport{}, which would silently drop the
+// connection-pool bounds, the TLS handshake timeout and HTTP/2.
+func TestSafeTransportKeepsStdlibDefaults(t *testing.T) {
+	def := http.DefaultTransport.(*http.Transport)
+	got, ok := safeTransport.(*http.Transport)
+	if !ok {
+		t.Fatalf("safeTransport is %T, want *http.Transport", safeTransport)
+	}
+
+	if got.Proxy != nil {
+		t.Error("safeTransport must not use a proxy: Control would validate the proxy address, not the target")
+	}
+	if !got.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 must stay set, or a custom DialContext drops the transport to HTTP/1.1")
+	}
+	if got.MaxIdleConns != def.MaxIdleConns {
+		t.Errorf("MaxIdleConns = %d, want %d (0 means unbounded)", got.MaxIdleConns, def.MaxIdleConns)
+	}
+	if got.IdleConnTimeout != def.IdleConnTimeout {
+		t.Errorf("IdleConnTimeout = %v, want %v (0 means idle conns are never reaped)", got.IdleConnTimeout, def.IdleConnTimeout)
+	}
+	if got.TLSHandshakeTimeout != def.TLSHandshakeTimeout {
+		t.Errorf("TLSHandshakeTimeout = %v, want %v", got.TLSHandshakeTimeout, def.TLSHandshakeTimeout)
+	}
+	if got.ExpectContinueTimeout != def.ExpectContinueTimeout {
+		t.Errorf("ExpectContinueTimeout = %v, want %v", got.ExpectContinueTimeout, def.ExpectContinueTimeout)
+	}
 }
